@@ -1,0 +1,33 @@
+@import "tailwindcss";
+
+@theme {
+  /* GitHub dark palette */
+  --color-bg: #0d1117;
+  --color-bg-secondary: #161b22;
+  --color-bg-tertiary: #21262d;
+  --color-border: #30363d;
+  --color-border-muted: #21262d;
+  --color-text-primary: #e6edf3;
+  --color-text-secondary: #8b949e;
+  --color-text-muted: #484f58;
+  --color-accent: #2ea043;
+  --color-accent-hover: #3fb950;
+  --color-accent-subtle: rgba(46, 160, 67, 0.15);
+  --color-accent-border: #238636;
+  --color-danger: #f85149;
+  --color-btn-hover: #30363d;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  background-color: #0d1117;
+  color: #e6edf3;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans",
+    Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
