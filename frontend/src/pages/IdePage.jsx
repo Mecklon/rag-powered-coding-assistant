@@ -1,7 +1,9 @@
 import { useEffect, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { FaArrowLeft, FaCodeBranch, FaExclamationTriangle, FaSpinner } from "react-icons/fa";
+import Editor from "@monaco-editor/react";
 import api from "../api/api";
+import FileTree from "../components/FileTree";
 
 const IdePage = () => {
   const { owner, repo } = useParams();
@@ -11,6 +13,22 @@ const IdePage = () => {
   const [hasBranch, setHasBranch] = useState(false);
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState(null);
+  const [selectedFile, setSelectedFile] = useState(null);
+  const [chatInput, setChatInput] = useState("");
+
+  // Maps a file path/name to a Monaco language id.
+  const guessLanguage = (path) => {
+    if (!path) return "plaintext";
+    const ext = path.split(".").pop().toLowerCase();
+    const map = {
+      js: "javascript", jsx: "javascript", ts: "typescript", tsx: "typescript",
+      json: "json", html: "html", css: "css", xml: "xml", md: "markdown",
+      java: "java", py: "python", c: "c", cpp: "cpp", h: "cpp", cs: "csharp",
+      sh: "shell", yml: "yaml", yaml: "yaml", sql: "sql", php: "php",
+      rb: "ruby", go: "go", rs: "rust",
+    };
+    return map[ext] || "plaintext";
+  };
 
   useEffect(() => {
     let cancelled = false;
@@ -45,7 +63,7 @@ const IdePage = () => {
   };
 
   return (
-    <div className="flex min-h-screen flex-col bg-bg">
+    <div className="flex h-screen flex-col bg-bg">
       {/* Header */}
       <header className="flex items-center justify-between border-b border-border bg-bg-secondary px-6 py-3">
         <div className="flex items-center gap-3">
@@ -62,19 +80,72 @@ const IdePage = () => {
         </div>
       </header>
 
-      {/* Main */}
-      <main className="flex flex-1 items-center justify-center px-6">
+      {/* Main - fill remaining height */}
+      <main className="flex min-h-0 flex-1">
         {checking ? (
+          <div className="flex flex-1 items-center justify-center">
           <div className="flex items-center gap-3 text-text-secondary">
             <FaSpinner className="animate-spin text-accent" />
             Checking RAG IDE branch...
           </div>
+          </div>
         ) : hasBranch ? (
-          <div className="flex items-center gap-3 rounded-lg border border-accent-border bg-accent-subtle px-6 py-4 text-accent">
-            <FaCodeBranch />
-            RAG IDE branch is ready.
+          <div className="flex h-full w-full gap-0">
+            {/* Left: file explorer */}
+            <aside className="w-64 shrink-0 border-r border-border bg-bg-secondary">
+              <div className="border-b border-border px-4 py-2 text-xs font-semibold uppercase tracking-wide text-text-secondary">
+                Explorer
+              </div>
+              <FileTree onSelectFile={setSelectedFile} />
+            </aside>
+
+            {/* Center: Monaco editor */}
+            <main className="flex-1 overflow-hidden bg-bg">
+              <div className="flex h-full flex-col">
+                <div className="flex items-center justify-between border-b border-border bg-bg-secondary px-4 py-2">
+                  <span className="text-sm font-medium text-text-primary">
+                    {selectedFile || (owner && repo && `${owner}/${repo}`)}
+                  </span>
+                </div>
+                <Editor
+                  height="100%"
+                  theme="vs-dark"
+                  defaultLanguage={guessLanguage(selectedFile)}
+                  path={selectedFile || undefined}
+                  defaultValue={
+                    selectedFile
+                      ? `// ${selectedFile}`
+                      : "// Select a file from the explorer"
+                  }
+                  options={{
+                    fontSize: 14,
+                    minimap: { enabled: true },
+                    automaticLayout: true,
+                  }}
+                />
+              </div>
+            </main>
+
+            {/* Right panel: AI chat */}
+            <aside className="flex w-80 shrink-0 flex-col border-l border-border bg-bg-secondary">
+              <div className="border-b border-border px-4 py-2 text-xs font-semibold uppercase tracking-wide text-text-secondary">
+                AI Assistant
+              </div>
+              <div className="flex-1 overflow-y-auto p-4 text-sm text-text-secondary">
+                Ask the assistant about your code.
+              </div>
+              <div className="flex items-center gap-2 border-t border-border p-3">
+                <input
+                  value={chatInput}
+                  onChange={(e) => setChatInput(e.target.value)}
+                  placeholder="Chat input..."
+                  className="flex-1 rounded-md border border-border bg-bg-tertiary px-3 py-2 text-sm text-text-primary placeholder:text-text-muted focus:border-accent-border focus:outline-none"
+                />
+              </div>
+            </aside>
           </div>
         ) : (
+          <div className="flex flex-1 items-center justify-center px-6">
           <div className="w-full max-w-md rounded-lg border border-border bg-bg-secondary p-8 text-center">
             <FaCodeBranch className="mx-auto mb-4 text-4xl text-accent" />
             <h2 className="text-xl font-semibold text-text-primary">
@@ -110,6 +181,7 @@ const IdePage = () => {
                 </>
               )}
             </button>
+          </div>
           </div>
         )}
       </main>
