@@ -5,14 +5,13 @@ import java.util.Optional;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import lombok.RequiredArgsConstructor;
+
 @Service
+@RequiredArgsConstructor
 public class UserService {
 
     private final UserRepository userRepository;
-
-    public UserService(UserRepository userRepository) {
-        this.userRepository = userRepository;
-    }
 
     /**
      * Finds or creates a user from GitHub OAuth profile data and stores the
@@ -47,5 +46,15 @@ public class UserService {
 
     public Optional<User> findByGithubId(String githubId) {
         return userRepository.findByGithubId(githubId);
+    }
+
+    /**
+     * Returns the stored GitHub access token for the given user id, or null if
+     * the user does not exist.
+     */
+    public String getAccessToken(Long userId) {
+        return userRepository.findById(userId)
+                .map(User::getAccessToken)
+                .orElse(null);
     }
 }

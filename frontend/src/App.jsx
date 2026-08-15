@@ -1,6 +1,8 @@
 import { useSelector } from 'react-redux'
+import { Routes, Route, Navigate } from 'react-router-dom'
 import LoginPage from './pages/LoginPage'
 import HomePage from './pages/HomePage'
+import IdePage from './pages/IdePage'
 import './App.css'
 
 function App() {
@@ -18,7 +20,17 @@ function App() {
     )
   }
 
-  return user ? <HomePage /> : <LoginPage />
+  if (!user) {
+    return <LoginPage />
+  }
+
+  return (
+    <Routes>
+      <Route path="/" element={<HomePage />} />
+      <Route path="/ide/:owner/:repo" element={<IdePage />} />
+      <Route path="*" element={<Navigate to="/" replace />} />
+    </Routes>
+  )
 }
 
 export default App

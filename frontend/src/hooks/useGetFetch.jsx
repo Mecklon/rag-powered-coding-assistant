@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import api from "../api/api";
 import { useDispatch } from "react-redux";
-import { addErrorWithTimeout } from "../../store/ErrorSlice";
+import { addErrorWithTimeout } from "../store/slices/ErrorSlice";
 
 const useGetFetch = (initialValue = null) => {
   const [state, setState] = useState(initialValue);
@@ -26,6 +26,11 @@ const useGetFetch = (initialValue = null) => {
       setState(res.data);
       return res.data;
     } catch (error) {
+      // Ignore aborted/cancelled requests (e.g. StrictMode double-invoke or
+      // a newer fetch superseding this one). These are not real errors.
+      if (error.code === "ERR_CANCELED" || error.name === "CanceledError") {
+        return;
+      }
       if(error.response){
         console.log("server error")
         console.log(error.response)
