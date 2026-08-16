@@ -20,7 +20,7 @@ public class GithubClientService {
     private static final String GITHUB_API = "https://api.github.com";
     private static final String USER_AGENT = "RagPoweredCodingAssistant";
     private static final String REPOS_URI = GITHUB_API + "/user/repos?per_page=100&sort=updated";
-    private static final String RAG_BRANCH_PREFIX = "MecklonsRAGIDE/";
+    private static final String RAG_BRANCH_PREFIX = "MecklonsRAGIDE.";
 
     private final RestClient.Builder restClientBuilder;
     private final ObjectMapper objectMapper;
@@ -133,16 +133,118 @@ public class GithubClientService {
         String branchName = RAG_BRANCH_PREFIX + defaultBranch;
         String createBody = "{\"ref\":\"refs/heads/" + branchName + "\",\"sha\":\"" + headSha + "\"}";
 
-        restClientBuilder.build()
-                .post()
-                .uri(GITHUB_API + "/repos/{owner}/{repo}/git/refs", owner, repo)
-                .header(HttpHeaders.AUTHORIZATION, "Bearer " + accessToken)
-                .header("User-Agent", USER_AGENT)
-                .contentType(MediaType.APPLICATION_JSON)
-                .body(createBody)
-                .retrieve()
-                .toBodilessEntity();
+        if (hasRagBranch(accessToken, owner, repo)) {
+            // Branch already exists (possibly stale). Force-update it to the
+            // current default branch head so it tracks the latest code.
+            String updateBody = "{\"sha\":\"" + headSha + "\",\"force\":true}";
+            restClientBuilder.build()
+                    .patch()
+                    .uri(GITHUB_API + "/repos/{owner}/{repo}/git/refs/heads/{branch}", owner, repo, branchName)
+                    .header(HttpHeaders.AUTHORIZATION, "Bearer " + accessToken)
+                    .header("User-Agent", USER_AGENT)
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .body(updateBody)
+                    .retrieve()
+                    .toBodilessEntity();
+        } else {
+            restClientBuilder.build()
+                    .post()
+                    .uri(GITHUB_API + "/repos/{owner}/{repo}/git/refs", owner, repo)
+                    .header(HttpHeaders.AUTHORIZATION, "Bearer " + accessToken)
+                    .header("User-Agent", USER_AGENT)
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .body(createBody)
+                    .retrieve()
+                    .toBodilessEntity();
+        }
 
         return branchName;
+    }
+
+    /**
+     * Fetches the recursive file tree of the given repository's RAG IDE branch
+     * (falling back to the default branch). Returns a list of file paths.
+     */
+    public List<String> getFileTree(String accessToken, String owner, String repo) {
+        String branch = resolveRagBranchName(accessToken, owner, repo);
+        System.out.println("RESOLVED BRANCH: " + branch);
+
+        String body = restClientBuilder.build()
+                .get()
+                .uri(GITHUB_API + "/repos/{owner}/{repo}/git/trees/{branch}?recursive=1", owner, repo, branch)
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + accessToken)
+                .header("User-Agent", USER_AGENT)
+                .accept(MediaType.APPLICATION_JSON)
+                .retrieve()
+                .body(String.class);
+
+        List<String> paths = new ArrayList<>();
+        if (body == null || body.isBlank()) {
+            return paths;
+        }
+        try {
+            JsonNode root = objectMapper.readTree(body);
+            System.out.println("TREE truncated=" + root.path("truncated").asBoolean() + " sha=" + root.path("sha").asText());
+            JsonNode tree = root.path("tree");
+            if (tree.isArray()) {
+                for (JsonNode node : tree) {
+                    String type = node.path("type").asText(null);
+                    String path = node.path("path").asText(null);
+                    if ("blob".equals(type) && path != null) {
+                        paths.add(path);
+                    }
+                }
+            }
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to parse GitHub file tree response", e);
+        }
+        System.out.println(paths);
+        return paths;
+    }
+
+    /**
+     * Fetches the raw content of a single file from the given repository's RAG
+     * IDE branch (falling back to the default branch).
+     */
+    public String getFileContent(String accessToken, String owner, String repo, String path) {
+        String branch = resolveRagBranchName(accessToken, owner, repo);
+
+        return restClientBuilder.build()
+                .get()
+                .uri(GITHUB_API + "/repos/{owner}/{repo}/contents/{path}?ref={branch}", owner, repo, path, branch)
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + accessToken)
+                .header("User-Agent", USER_AGENT)
+                // Request the raw file body (plain text), not the JSON object
+                // with base64-encoded content.
+                .accept(MediaType.parseMediaType("application/vnd.github.raw"))
+                .retrieve()
+                .body(String.class);
+    }
+
+    /**
+     * Resolves the RAG IDE branch name for a repo, or falls back to the
+     * default branch if no RAG branch exists yet.
+     */
+    private String resolveRagBranchName(String accessToken, String owner, String repo) {
+        String repoBody = restClientBuilder.build()
+                .get()
+                .uri(GITHUB_API + "/repos/{owner}/{repo}", owner, repo)
+                .header(HttpHeaders.AUTHORIZATION, "Bearer " + accessToken)
+                .header("User-Agent", USER_AGENT)
+                .accept(MediaType.APPLICATION_JSON)
+                .retrieve()
+                .body(String.class);
+
+        String defaultBranch;
+        try {
+            defaultBranch = objectMapper.readTree(repoBody).path("default_branch").asText("main");
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to resolve default branch for " + owner + "/" + repo, e);
+        }
+
+        if (hasRagBranch(accessToken, owner, repo)) {
+            return RAG_BRANCH_PREFIX + defaultBranch;
+        }
+        return defaultBranch;
     }
 }

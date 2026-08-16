@@ -84,4 +84,54 @@ public class GithubController {
         String branchName = githubClientService.createRagBranch(accessToken, owner, repo);
         return ResponseEntity.ok(Map.of("branch", branchName));
     }
+
+    /**
+     * Returns the recursive file tree of the given repository's RAG IDE branch.
+     */
+    @GetMapping("/repos/{owner}/{repo}/tree")
+    public ResponseEntity<?> getFileTree(@PathVariable String owner,
+                                         @PathVariable String repo,
+                                         Authentication authentication) {
+        if (authentication == null || !(authentication.getPrincipal() instanceof AuthenticatedUser principal)) {
+            return ResponseEntity.status(401).body(Map.of("message", "Not authenticated"));
+        }
+
+        String accessToken = userService.getAccessToken(principal.id());
+        if (accessToken == null || accessToken.isBlank()) {
+            return ResponseEntity.status(500).body(Map.of("message", "GitHub access token missing"));
+        }
+
+        List<String> paths = githubClientService.getFileTree(accessToken, owner, repo);
+        return ResponseEntity.ok(Map.of("paths", paths));
+    }
+
+    /**
+     * Returns the raw content of a single file from the repository's RAG IDE
+     * branch. The file path is sent in the request body to avoid issues with
+     * slashes and URL encoding in GET path variables.
+     */
+    @PostMapping("/repos/{owner}/{repo}/content")
+    public ResponseEntity<?> getFileContent(@PathVariable String owner,
+                                            @PathVariable String repo,
+                                            @org.springframework.web.bind.annotation.RequestBody Map<String, String> body,
+                                            Authentication authentication) {
+        System.out.println("getting file");
+        if (authentication == null || !(authentication.getPrincipal() instanceof AuthenticatedUser principal)) {
+            return ResponseEntity.status(401).body(Map.of("message", "Not authenticated"));
+        }
+
+        String path = body.get("path");
+        if (path == null || path.isBlank()) {
+            return ResponseEntity.badRequest().body(Map.of("message", "path is required"));
+        }
+
+        String accessToken = userService.getAccessToken(principal.id());
+        if (accessToken == null || accessToken.isBlank()) {
+            return ResponseEntity.status(500).body(Map.of("message", "GitHub access token missing"));
+        }
+
+        String content = githubClientService.getFileContent(accessToken, owner, repo, path);
+        System.out.println(content);
+        return ResponseEntity.ok(Map.of("path", path, "content", content));
+    }
 }

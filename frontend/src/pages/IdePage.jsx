@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
-import { FaArrowLeft, FaCodeBranch, FaExclamationTriangle, FaSpinner } from "react-icons/fa";
+import { FaArrowLeft, FaCodeBranch, FaExclamationTriangle, FaPaperPlane, FaSpinner } from "react-icons/fa";
 import Editor from "@monaco-editor/react";
 import api from "../api/api";
 import FileTree from "../components/FileTree";
@@ -15,6 +15,32 @@ const IdePage = () => {
   const [error, setError] = useState(null);
   const [selectedFile, setSelectedFile] = useState(null);
   const [chatInput, setChatInput] = useState("");
+
+  // File explorer state
+  const [paths, setPaths] = useState([]);
+  const [treeLoading, setTreeLoading] = useState(false);
+  // path -> content (only loaded files)
+  const [fileContents, setFileContents] = useState({});
+  // set of paths that have been edited (dirty)
+  const [dirtyFiles, setDirtyFiles] = useState(new Set());
+  const [fileLoading, setFileLoading] = useState(false);
+
+  // Per-repo conversation session id, persisted in localStorage.
+  const [sessionId, setSessionId] = useState(() => {
+    const key = `rag_session_${owner}_${repo}`;
+    let existing = localStorage.getItem(key);
+    if (!existing) {
+      existing = `session_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+      localStorage.setItem(key, existing);
+    }
+    return existing;
+  });
+
+  // AI chat response state: summary text + proposed changes (accept/reject).
+  const [chatSummary, setChatSummary] = useState("");
+  const [proposedChanges, setProposedChanges] = useState([]);
+  const [acceptedChanges, setAcceptedChanges] = useState(new Set());
+  const [rejectedChanges, setRejectedChanges] = useState(new Set());
 
   // Maps a file path/name to a Monaco language id.
   const guessLanguage = (path) => {
@@ -47,6 +73,55 @@ const IdePage = () => {
     };
   }, [owner, repo]);
 
+  // Fetch the file tree once the RAG branch is confirmed.
+  useEffect(() => {
+    if (!hasBranch) return;
+    let cancelled = false;
+    (async () => {
+      setTreeLoading(true);
+      try {
+        const res = await api.get(`/api/github/repos/${owner}/${repo}/tree`);
+        if (!cancelled) setPaths(res.data?.paths || []);
+      } catch (e) {
+        if (!cancelled) setError("Failed to load file tree.");
+      } finally {
+        if (!cancelled) setTreeLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [hasBranch, owner, repo]);
+
+  // Load a single file's content when selected.
+  const handleSelectFile = async (path) => {
+    setSelectedFile(path);
+    if (fileContents[path] !== undefined) return; // already loaded
+    setFileLoading(true);
+    try {
+      const res = await api.post(
+        `/api/github/repos/${owner}/${repo}/content`,
+        { path }
+      );
+      setFileContents((prev) => ({ ...prev, [path]: res.data?.content ?? "" }));
+    } catch (e) {
+      setError("Failed to load file content.");
+    } finally {
+      setFileLoading(false);
+    }
+  };
+
+  // Mark a file dirty when its editor content changes.
+  const handleEditorChange = (value) => {
+    if (!selectedFile) return;
+    setFileContents((prev) => ({ ...prev, [selectedFile]: value ?? "" }));
+    setDirtyFiles((prev) => {
+      const next = new Set(prev);
+      next.add(selectedFile);
+      return next;
+    });
+  };
+
   const handleCreateBranch = async () => {
     setCreating(true);
     setError(null);
@@ -60,6 +135,62 @@ const IdePage = () => {
     } finally {
       setCreating(false);
     }
+  };
+
+  // Send a chat prompt with the dirty files to the backend.
+  const [chatLoading, setChatLoading] = useState(false);
+  const handleChatSubmit = async () => {
+    const prompt = chatInput.trim();
+    if (!prompt || chatLoading) return;
+    console.log("sending")
+    const dirtyFilesPayload = Array.from(dirtyFiles)
+      .filter((path) => fileContents[path] !== undefined)
+      .map((path) => ({ path, content: fileContents[path] }));
+
+    setChatLoading(true);
+    setChatSummary("");
+    setProposedChanges([]);
+    setAcceptedChanges(new Set());
+    setChatInput("");
+    try {
+      const res = await api.post("/api/chat/prompt", {
+        owner,
+        repo,
+        prompt,
+        sessionId,
+        dirtyFiles: dirtyFilesPayload,
+      });
+      setChatSummary(res.data?.summary || "No response.");
+      setProposedChanges(res.data?.changes || []);
+    } catch (e) {
+      setError("Failed to send prompt.");
+    } finally {
+      setChatLoading(false);
+    }
+  };
+
+  // Accept a proposed change: update the editor content, unmark dirty, and
+  // tell the backend to refresh + re-vectorize the file.
+  const handleAcceptChange = async (change, index) => {
+    const path = change.filePath;
+    // Update the editor content with the new content.
+    setFileContents((prev) => ({ ...prev, [path]: change.newContent ?? "" }));
+    setAcceptedChanges((prev) => new Set(prev).add(index));
+    try {
+      await api.post("/api/chat/accept", {
+        owner,
+        repo,
+        filePath: path,
+        newContent: change.newContent ?? "",
+      });
+    } catch (e) {
+      setError("Failed to accept change.");
+    }
+  };
+
+  // Reject a proposed change: mark it as rejected (no backend call).
+  const handleRejectChange = async (index) => {
+    setRejectedChanges((prev) => new Set(prev).add(index));
   };
 
   return (
@@ -92,11 +223,20 @@ const IdePage = () => {
         ) : hasBranch ? (
           <div className="flex h-full w-full gap-0">
             {/* Left: file explorer */}
-            <aside className="w-64 shrink-0 border-r border-border bg-bg-secondary">
+            <aside className="flex w-64 shrink-0 flex-col border-r border-border bg-bg-secondary">
               <div className="border-b border-border px-4 py-2 text-xs font-semibold uppercase tracking-wide text-text-secondary">
                 Explorer
               </div>
-              <FileTree onSelectFile={setSelectedFile} />
+              {treeLoading ? (
+                <div className="flex items-center gap-2 p-4 text-sm text-text-secondary">
+                  <FaSpinner className="animate-spin text-accent" />
+                  Loading tree...
+                </div>
+              ) : (
+                <div className="flex min-h-0 flex-1 flex-col">
+                  <FileTree paths={paths} onSelectFile={handleSelectFile} />
+                </div>
+              )}
             </aside>
 
             {/* Center: Monaco editor */}
@@ -106,23 +246,36 @@ const IdePage = () => {
                   <span className="text-sm font-medium text-text-primary">
                     {selectedFile || (owner && repo && `${owner}/${repo}`)}
                   </span>
+                  {dirtyFiles.has(selectedFile) && (
+                    <span className="rounded-full border border-accent-border bg-accent-subtle px-2 py-0.5 text-xs text-accent">
+                      ● dirty
+                    </span>
+                  )}
                 </div>
-                <Editor
-                  height="100%"
-                  theme="vs-dark"
-                  defaultLanguage={guessLanguage(selectedFile)}
-                  path={selectedFile || undefined}
-                  defaultValue={
-                    selectedFile
-                      ? `// ${selectedFile}`
-                      : "// Select a file from the explorer"
-                  }
-                  options={{
-                    fontSize: 14,
-                    minimap: { enabled: true },
-                    automaticLayout: true,
-                  }}
-                />
+                {!selectedFile ? (
+                  <div className="flex flex-1 items-center justify-center text-text-muted">
+                    Select a file from the explorer
+                  </div>
+                ) : fileLoading ? (
+                  <div className="flex flex-1 items-center justify-center gap-2 text-text-secondary">
+                    <FaSpinner className="animate-spin text-accent" />
+                    Loading file...
+                  </div>
+                ) : (
+                  <Editor
+                    height="100%"
+                    theme="vs-dark"
+                    language={guessLanguage(selectedFile)}
+                    path={selectedFile}
+                    value={fileContents[selectedFile] ?? ""}
+                    onChange={handleEditorChange}
+                    options={{
+                      fontSize: 14,
+                      minimap: { enabled: true },
+                      automaticLayout: true,
+                    }}
+                  />
+                )}
               </div>
             </main>
 
@@ -131,16 +284,80 @@ const IdePage = () => {
               <div className="border-b border-border px-4 py-2 text-xs font-semibold uppercase tracking-wide text-text-secondary">
                 AI Assistant
               </div>
-              <div className="flex-1 overflow-y-auto p-4 text-sm text-text-secondary">
-                Ask the assistant about your code.
+              <div className="flex-1 overflow-y-auto p-4 text-sm">
+                {chatLoading ? (
+                  <p className="text-text-secondary">Thinking...</p>
+                ) : chatSummary ? (
+                  <div>
+                    <p className="whitespace-pre-wrap text-text-primary">{chatSummary}</p>
+
+                    {proposedChanges?.length > 0 && (
+                      <div className="mt-4 space-y-3">
+                        <h3 className="text-xs font-semibold uppercase tracking-wide text-text-secondary">
+                          Proposed changes
+                        </h3>
+                        {proposedChanges.map((change, i) => {
+                          const accepted = acceptedChanges.has(i);
+                          const rejected = rejectedChanges.has(i);
+                          return (
+                            <div
+                              key={i}
+                              className="rounded-md border border-border bg-bg p-3"
+                            >
+                              <div className="mb-2 flex items-center justify-between">
+                                <span className="truncate font-mono text-xs text-accent">
+                                  {change.filePath}
+                                </span>
+                                <span className="text-xs text-text-muted">
+                                  {accepted ? "Accepted" : rejected ? "Rejected" : ""}
+                                </span>
+                              </div>
+                              <pre className="max-h-40 overflow-auto whitespace-pre-wrap rounded bg-bg-tertiary p-2 text-xs text-text-secondary">
+                                {change.newContent}
+                              </pre>
+                              {!accepted && !rejected && (
+                                <div className="mt-2 flex gap-2">
+                                  <button
+                                    onClick={() => handleAcceptChange(change, i)}
+                                    className="flex-1 rounded-md bg-accent px-2 py-1 text-xs font-semibold text-white hover:bg-accent-hover"
+                                  >
+                                    Accept
+                                  </button>
+                                  <button
+                                    onClick={() => handleRejectChange(i)}
+                                    className="flex-1 rounded-md border border-border bg-bg-tertiary px-2 py-1 text-xs text-text-primary hover:border-danger hover:text-danger"
+                                  >
+                                    Reject
+                                  </button>
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <p className="text-text-secondary">Ask the assistant about your code.</p>
+                )}
               </div>
               <div className="flex items-center gap-2 border-t border-border p-3">
                 <input
                   value={chatInput}
                   onChange={(e) => setChatInput(e.target.value)}
+                  onKeyDown={(e) => e.key === "Enter" && handleChatSubmit()}
                   placeholder="Chat input..."
+                  disabled={chatLoading}
                   className="flex-1 rounded-md border border-border bg-bg-tertiary px-3 py-2 text-sm text-text-primary placeholder:text-text-muted focus:border-accent-border focus:outline-none"
                 />
+                <button
+                  onClick={handleChatSubmit}
+                  disabled={chatLoading || !chatInput.trim()}
+                  className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-accent text-white transition-colors hover:bg-accent-hover disabled:cursor-not-allowed disabled:opacity-50"
+                  title="Send"
+                >
+                  <FaPaperPlane />
+                </button>
               </div>
             </aside>
           </div>
@@ -153,7 +370,7 @@ const IdePage = () => {
             </h2>
             <p className="mt-2 text-sm text-text-secondary">
               This repository doesn't have a{" "}
-              <span className="font-mono text-accent">MecklonsRAGIDE/*</span>{" "}
+              <span className="font-mono text-accent">MecklonsRAGIDE.*</span>{" "}
               branch yet. Create one to start working in the IDE.
             </p>
 
