@@ -1,2 +1,5 @@
 
 backend/repos/
+
+# Application properties (contains secrets/credentials)
+**/src/main/**/resources/application.properties
