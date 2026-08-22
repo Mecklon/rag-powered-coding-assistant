@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { useParams, useNavigate } from "react-router-dom";
 import { FaArrowLeft, FaCodeBranch, FaExclamationTriangle, FaPaperPlane, FaSpinner } from "react-icons/fa";
-import Editor from "@monaco-editor/react";
+import Editor, { DiffEditor } from "@monaco-editor/react";
 import api from "../api/api";
 import FileTree from "../components/FileTree";
 
@@ -36,11 +36,14 @@ const IdePage = () => {
     return existing;
   });
 
-  // AI chat response state: summary text + proposed changes (accept/reject).
+  // AI chat response state: summary text + streaming tool events.
   const [chatSummary, setChatSummary] = useState("");
+  const [toolEvents, setToolEvents] = useState([]);
   const [proposedChanges, setProposedChanges] = useState([]);
   const [acceptedChanges, setAcceptedChanges] = useState(new Set());
   const [rejectedChanges, setRejectedChanges] = useState(new Set());
+  // Index of the proposed change currently shown in the Monaco diff editor.
+  const [reviewIndex, setReviewIndex] = useState(null);
 
   // Maps a file path/name to a Monaco language id.
   const guessLanguage = (path) => {
@@ -137,31 +140,55 @@ const IdePage = () => {
     }
   };
 
-  // Send a chat prompt with the dirty files to the backend.
+  // Send a chat prompt to the agent loop.
   const [chatLoading, setChatLoading] = useState(false);
   const handleChatSubmit = async () => {
     const prompt = chatInput.trim();
     if (!prompt || chatLoading) return;
     console.log("sending")
-    const dirtyFilesPayload = Array.from(dirtyFiles)
-      .filter((path) => fileContents[path] !== undefined)
-      .map((path) => ({ path, content: fileContents[path] }));
 
     setChatLoading(true);
     setChatSummary("");
+    setToolEvents([]);
     setProposedChanges([]);
     setAcceptedChanges(new Set());
     setChatInput("");
     try {
-      const res = await api.post("/api/chat/prompt", {
-        owner,
-        repo,
-        prompt,
-        sessionId,
-        dirtyFiles: dirtyFilesPayload,
+      // Stream the agent run via SSE. Each event is a JSON object.
+      const res = await fetch("http://localhost:9090/api/agent/run", {
+        method: "POST",
+        credentials: "include",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ owner, repo, prompt, sessionId }),
       });
-      setChatSummary(res.data?.summary || "No response.");
-      setProposedChanges(res.data?.changes || []);
+      if (!res.ok || !res.body) {
+        throw new Error("Agent request failed");
+      }
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        // SSE events are separated by blank lines.
+        const events = buffer.split(/\n\n/);
+        buffer = events.pop();
+        for (const evt of events) {
+          const dataLine = evt.split("\n").find((l) => l.startsWith("data:"));
+          if (!dataLine) continue;
+          const payload = JSON.parse(dataLine.slice(5).trim());
+          handleAgentEvent(payload);
+        }
+      }
+      // Flush any remaining event that didn't end with a blank line.
+      if (buffer.trim()) {
+        const dataLine = buffer.split("\n").find((l) => l.startsWith("data:"));
+        if (dataLine) {
+          const payload = JSON.parse(dataLine.slice(5).trim());
+          handleAgentEvent(payload);
+        }
+      }
     } catch (e) {
       setError("Failed to send prompt.");
     } finally {
@@ -169,13 +196,45 @@ const IdePage = () => {
     }
   };
 
+  // Handle a single SSE event from the agent loop.
+  const handleAgentEvent = (payload) => {
+    if (payload.type === "TOOL_START") {
+      setToolEvents((prev) => [
+        ...prev,
+        { tool: payload.tool, message: payload.message },
+      ]);
+    } else if (payload.type === "DONE") {
+      setChatSummary(payload.summary || "No response.");
+    } else if (payload.type === "ERROR") {
+      setError(payload.message || "Agent error.");
+    }
+  };
+
   // Accept a proposed change: update the editor content, unmark dirty, and
   // tell the backend to refresh + re-vectorize the file.
+  // Find the next unresolved proposed change to review, wrapping around.
+  const findNextReview = (currentIndex, accepted, rejected) => {
+    for (let i = currentIndex + 1; i < proposedChanges.length; i++) {
+      if (!accepted.has(i) && !rejected.has(i)) return i;
+    }
+    for (let i = 0; i < proposedChanges.length; i++) {
+      if (!accepted.has(i) && !rejected.has(i)) return i;
+    }
+    return null;
+  };
+
   const handleAcceptChange = async (change, index) => {
     const path = change.filePath;
     // Update the editor content with the new content.
     setFileContents((prev) => ({ ...prev, [path]: change.newContent ?? "" }));
-    setAcceptedChanges((prev) => new Set(prev).add(index));
+    // The accepted content is now the source of truth for this file.
+    setDirtyFiles((prev) => {
+      const next = new Set(prev);
+      next.delete(path);
+      return next;
+    });
+    const newAccepted = new Set(acceptedChanges).add(index);
+    setAcceptedChanges(newAccepted);
     try {
       await api.post("/api/chat/accept", {
         owner,
@@ -186,12 +245,19 @@ const IdePage = () => {
     } catch (e) {
       setError("Failed to accept change.");
     }
+    setReviewIndex(findNextReview(index, newAccepted, rejectedChanges));
   };
 
   // Reject a proposed change: mark it as rejected (no backend call).
-  const handleRejectChange = async (index) => {
-    setRejectedChanges((prev) => new Set(prev).add(index));
+  const handleRejectChange = (index) => {
+    const newRejected = new Set(rejectedChanges).add(index);
+    setRejectedChanges(newRejected);
+    setReviewIndex(findNextReview(index, acceptedChanges, newRejected));
   };
+
+  // The proposed change currently shown in the diff editor (if any).
+  const reviewChange =
+    reviewIndex !== null ? proposedChanges[reviewIndex] : null;
 
   return (
     <div className="flex h-screen flex-col bg-bg">
@@ -239,20 +305,89 @@ const IdePage = () => {
               )}
             </aside>
 
-            {/* Center: Monaco editor */}
+            {/* Center: Monaco editor / diff review */}
             <main className="flex-1 overflow-hidden bg-bg">
               <div className="flex h-full flex-col">
                 <div className="flex items-center justify-between border-b border-border bg-bg-secondary px-4 py-2">
                   <span className="text-sm font-medium text-text-primary">
-                    {selectedFile || (owner && repo && `${owner}/${repo}`)}
+                    {reviewChange
+                      ? `Review: ${reviewChange.filePath}`
+                      : selectedFile || (owner && repo && `${owner}/${repo}`)}
                   </span>
-                  {dirtyFiles.has(selectedFile) && (
+                  {!reviewChange && dirtyFiles.has(selectedFile) && (
                     <span className="rounded-full border border-accent-border bg-accent-subtle px-2 py-0.5 text-xs text-accent">
                       ● dirty
                     </span>
                   )}
                 </div>
-                {!selectedFile ? (
+
+                {reviewChange ? (
+                  <>
+                    {/* File selector when multiple changes are proposed */}
+                    {proposedChanges.length > 1 && (
+                      <div className="flex items-center gap-1 overflow-x-auto border-b border-border bg-bg-secondary px-3 py-1.5">
+                        {proposedChanges.map((c, i) => {
+                          const resolved = acceptedChanges.has(i) || rejectedChanges.has(i);
+                          return (
+                            <button
+                              key={i}
+                              onClick={() => setReviewIndex(i)}
+                              className={`shrink-0 rounded-md border px-2 py-1 text-xs font-mono ${
+                                i === reviewIndex
+                                  ? "border-accent bg-accent-subtle text-accent"
+                                  : "border-border bg-bg-tertiary text-text-secondary hover:bg-bg-tertiary"
+                              }`}
+                            >
+                              {c.filePath}
+                              {acceptedChanges.has(i) ? " ✓" : rejectedChanges.has(i) ? " ✗" : ""}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+
+                    <DiffEditor
+                      original={reviewChange.oldContent ?? ""}
+                      modified={reviewChange.newContent ?? ""}
+                      language={guessLanguage(reviewChange.filePath)}
+                      theme="vs-dark"
+                      height="100%"
+                      options={{
+                        fontSize: 14,
+                        minimap: { enabled: true },
+                        automaticLayout: true,
+                      }}
+                    />
+
+                    {/* Accept / Reject bar */}
+                    <div className="flex items-center gap-2 border-t border-border bg-bg-secondary px-4 py-2">
+                      <span className="truncate font-mono text-xs text-text-secondary">
+                        {reviewChange.filePath}
+                      </span>
+                      <div className="flex-1" />
+                      {acceptedChanges.has(reviewIndex) || rejectedChanges.has(reviewIndex) ? (
+                        <span className="text-xs font-semibold text-text-muted">
+                          {acceptedChanges.has(reviewIndex) ? "Accepted" : "Rejected"}
+                        </span>
+                      ) : (
+                        <>
+                          <button
+                            onClick={() => handleRejectChange(reviewIndex)}
+                            className="rounded-md border border-border bg-bg-tertiary px-3 py-1.5 text-sm text-text-primary hover:border-danger hover:text-danger"
+                          >
+                            Reject
+                          </button>
+                          <button
+                            onClick={() => handleAcceptChange(reviewChange, reviewIndex)}
+                            className="rounded-md bg-accent px-3 py-1.5 text-sm font-semibold text-white hover:bg-accent-hover"
+                          >
+                            Accept
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  </>
+                ) : !selectedFile ? (
                   <div className="flex flex-1 items-center justify-center text-text-muted">
                     Select a file from the explorer
                   </div>
@@ -286,57 +421,21 @@ const IdePage = () => {
               </div>
               <div className="flex-1 overflow-y-auto p-4 text-sm">
                 {chatLoading ? (
-                  <p className="text-text-secondary">Thinking...</p>
-                ) : chatSummary ? (
-                  <div>
-                    <p className="whitespace-pre-wrap text-text-primary">{chatSummary}</p>
-
-                    {proposedChanges?.length > 0 && (
-                      <div className="mt-4 space-y-3">
-                        <h3 className="text-xs font-semibold uppercase tracking-wide text-text-secondary">
-                          Proposed changes
-                        </h3>
-                        {proposedChanges.map((change, i) => {
-                          const accepted = acceptedChanges.has(i);
-                          const rejected = rejectedChanges.has(i);
-                          return (
-                            <div
-                              key={i}
-                              className="rounded-md border border-border bg-bg p-3"
-                            >
-                              <div className="mb-2 flex items-center justify-between">
-                                <span className="truncate font-mono text-xs text-accent">
-                                  {change.filePath}
-                                </span>
-                                <span className="text-xs text-text-muted">
-                                  {accepted ? "Accepted" : rejected ? "Rejected" : ""}
-                                </span>
-                              </div>
-                              <pre className="max-h-40 overflow-auto whitespace-pre-wrap rounded bg-bg-tertiary p-2 text-xs text-text-secondary">
-                                {change.newContent}
-                              </pre>
-                              {!accepted && !rejected && (
-                                <div className="mt-2 flex gap-2">
-                                  <button
-                                    onClick={() => handleAcceptChange(change, i)}
-                                    className="flex-1 rounded-md bg-accent px-2 py-1 text-xs font-semibold text-white hover:bg-accent-hover"
-                                  >
-                                    Accept
-                                  </button>
-                                  <button
-                                    onClick={() => handleRejectChange(i)}
-                                    className="flex-1 rounded-md border border-border bg-bg-tertiary px-2 py-1 text-xs text-text-primary hover:border-danger hover:text-danger"
-                                  >
-                                    Reject
-                                  </button>
-                                </div>
-                              )}
-                            </div>
-                          );
-                        })}
+                  <div className="space-y-2">
+                    <p className="text-text-secondary">Thinking...</p>
+                    {toolEvents.map((evt, i) => (
+                      <div
+                        key={i}
+                        className="flex items-center gap-2 rounded-md border border-border bg-bg-tertiary px-2 py-1.5 text-xs"
+                      >
+                        <FaSpinner className="animate-spin text-accent" />
+                        <span className="font-mono text-accent">{evt.tool}</span>
+                        <span className="text-text-secondary">{evt.message}</span>
                       </div>
-                    )}
+                    ))}
                   </div>
+                ) : chatSummary ? (
+                  <p className="whitespace-pre-wrap text-text-primary">{chatSummary}</p>
                 ) : (
                   <p className="text-text-secondary">Ask the assistant about your code.</p>
                 )}

@@ -1,5 +1,7 @@
 package com.mecklon.RagPoweredCodingAssistant.configs;
 
+import jakarta.servlet.DispatcherType;
+
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.security.config.annotation.web.builders.HttpSecurity;
@@ -36,6 +38,7 @@ public class SecurityConfigs {
                 .cors(cors -> cors.configurationSource(corsConfigurationSource))
                 .sessionManagement(session -> session.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
                 .authorizeHttpRequests(auth -> auth
+                        .dispatcherTypeMatchers(DispatcherType.ASYNC).permitAll()
                         .requestMatchers("/api/auth/**", "/oauth2/**", "/login/**", "/error").permitAll()
                         .anyRequest().authenticated())
                 .oauth2Login(oauth -> oauth
